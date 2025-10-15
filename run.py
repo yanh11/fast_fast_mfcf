@@ -1,12 +1,18 @@
 from fast_fast_mfcf import MFCF
 from fast_fast_mfcf import mfcf_control
 import numpy as np
+import logging
+
+
+logging.basicConfig(level=logging.INFO)
+
 
 np.random.seed(42)
-size = 10
+size = 100
 random_matrix = np.random.rand(size, size)
 # Make it symmetric by averaging with its transpose
 C = (random_matrix + random_matrix.T) / 2
+
 
 ctl = mfcf_control()
 
