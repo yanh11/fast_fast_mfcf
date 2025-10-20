@@ -49,4 +49,4 @@ Outputs:
 * `cliques`: list of maximal cliques
 * `separators`: list of separators
 * `peo`: perfect elimination ordering
-* `J_log`: energy or log-likelihood measure (depending on configuration)
+* `J_log`: logo matrix
