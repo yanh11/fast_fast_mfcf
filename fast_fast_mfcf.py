@@ -2,6 +2,7 @@ import heapq
 import itertools
 import logging
 from collections import Counter
+from dataclasses import dataclass
 from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -21,6 +22,30 @@ logger = logging.getLogger(__name__)
 Node = int
 Clique = FrozenSet[int]
 Separator = FrozenSet[int]
+
+# -----------------------------------------------------------------------------
+# Separator wrapper for comparison in priority queue
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SeparatorWrapper:
+    separator: FrozenSet[int]
+    separator_prior_threshold: FrozenSet[int]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, SeparatorWrapper):
+            return self.separator == other.separator
+        return NotImplemented
+
+    def __le__(self, other: object) -> bool:  # subset-or-equal comparison
+        if isinstance(other, SeparatorWrapper):
+            return self.separator <= other.separator or self.separator_prior_threshold <= other.separator_prior_threshold
+        return NotImplemented
+
+    def __ge__(self, other: object) -> bool:  # superset-or-equal comparison
+        if isinstance(other, SeparatorWrapper):
+            return self.separator >= other.separator or self.separator_prior_threshold >= other.separator_prior_threshold
+        return NotImplemented
 
 
 # -----------------------------------------------------------------------------
@@ -80,33 +105,98 @@ class Gains:
 
         self._threshold: float = float(ctl.get("threshold", 0.0))
         self._min_clique_size: int = int(ctl.get("min_clique_size", 1))
-        self._max_clique_size: int = int(ctl.get("max_clique_size", 4))
-        self._cachesize = ctl.get("cachesize", np.inf)
 
-    def get_gain(self, v: Node, sep: List[Node]) -> Tuple[float, Separator]:
-        """Compute gain for adding v with a candidate separator list."""
-        values, ranked_sep = self._greedy_sortsep(v, sep)
-        values, ranked_sep = self._apply_threshold(values, ranked_sep)
-        gain = float(np.sum(values))
-        return gain, frozenset(int(x) for x in ranked_sep)
+    def get_best_gain(
+        self,
+        outstanding_nodes_mask: np.ndarray,
+        sep: "Separator",
+    ) -> Tuple[float, "Node", "SeparatorWrapper"]:
+        """
+        Vectorized: compute best gain over all outstanding nodes for a given separator.
+        """
+        if not sep:
+            # With empty sep, all gains are 0; choose the first outstanding node
+            first = int(outstanding_nodes_mask.argmax())
+            empty = frozenset()
+            return 0.0, first, SeparatorWrapper(empty, empty)
 
-    # --- internals ------------------------------------------------------------
+        # 1) Prepare indices/submatrix and mandatory-picks k
+        rows, cols, W_sub = self._prepare_submatrix(outstanding_nodes_mask, sep)
 
-    def _greedy_sortsep(self, v: Node, sep: List[Node]) -> Tuple[np.ndarray, np.ndarray]:
-        """Sort separator nodes for v by descending weight."""
-        cols = np.asarray(sep, dtype=int)
-        weights = self._W[v, cols]
-        order = np.argsort(weights)[::-1]
-        return weights[order], cols[order]
+        # number of mandatory picks from top weights
+        k = max(0, min(self._min_clique_size - 1, W_sub.shape[1]))
 
-    def _apply_threshold(self, val: np.ndarray, sep: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Apply per-edge threshold; always keep first (min_clique_size-1) edges."""
-        idx = val >= self._threshold
-        # ensure enough seeds for minimum clique size
-        keep_prefix = max(0, self._min_clique_size - 1)
-        idx[:keep_prefix] = True
-        return val[idx], sep[idx]
+        # 2) Compute row-wise gains and masks needed for reconstruction
+        gains, T, topk_idx, topk_in_T = self._row_gains(W_sub, self._threshold, k)
 
+        # 3) Pick best row and reconstruct the kept separator columns for that row
+        best_row_pos = int(np.argmax(gains))
+        best_node = int(rows[best_row_pos])
+        best_gain = float(gains[best_row_pos])
+
+        best_sep = self._separator_for_row(
+            cols=cols,
+            T_row=T[best_row_pos],
+            row_topk_idx=topk_idx[best_row_pos],
+            row_topk_in_T=topk_in_T[best_row_pos],
+            k=k,
+            sep=sep,
+        )
+
+        return best_gain, best_node, best_sep
+
+    # --------------------
+    # Helpers
+    # --------------------
+
+    def _prepare_submatrix(
+        self,
+        outstanding_nodes_mask: np.ndarray,
+        sep: "Separator",
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        rows = np.flatnonzero(outstanding_nodes_mask)
+        cols = np.asarray(list(sep), dtype=int)
+
+        W_sub = self._W[np.ix_(rows, cols)]
+        return rows, cols, W_sub
+
+    def _row_gains(
+        self,
+        W_sub: np.ndarray,
+        threshold: float,
+        k: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        T = W_sub >= threshold
+        gains = np.where(T, W_sub, 0.0).sum(axis=1)
+
+        if k:
+            topk_idx = np.argpartition(W_sub, -k, axis=1)[:, -k:]
+            topk_vals = np.take_along_axis(W_sub, topk_idx, axis=1)
+            topk_in_T = np.take_along_axis(T, topk_idx, axis=1)
+            gains += np.where(~topk_in_T, topk_vals, 0.0).sum(axis=1)
+        else:
+            # Keep shapes consistent
+            R = W_sub.shape[0]
+            topk_idx = np.empty((R, 0), dtype=int)
+            topk_in_T = np.empty((R, 0), dtype=bool)
+
+        return gains, T, topk_idx, topk_in_T
+
+    def _separator_for_row(
+        self,
+        cols: np.ndarray,
+        T_row: np.ndarray,
+        row_topk_idx: np.ndarray,
+        row_topk_in_T: np.ndarray,
+        k: int,
+        sep: "Separator",
+    ) -> "SeparatorWrapper":
+        keep_mask = T_row.copy()
+        if k:
+            keep_mask[row_topk_idx[~row_topk_in_T]] = True
+
+        kept = frozenset(cols[keep_mask])
+        return SeparatorWrapper(kept, frozenset(sep))
 
 # =============================================================================
 # MFCF
@@ -133,7 +223,7 @@ class MFCF:
         """
         self._C = C
         self._ctl = ctl
-        self._gf = Gains(C, ctl, gf_type).get_gain
+        self._gf = Gains(C, ctl, gf_type).get_best_gain
 
         self._initialise()
         self._compute_mfcf()
@@ -147,7 +237,7 @@ class MFCF:
     # -------------------------------------------------------------------------
     def _initialise(self) -> None:
         """Prepare data structures and seed clique."""
-        self._gains_pq: List[Tuple[float, Node, Separator]] = []
+        self._gains_pq: List[Tuple[float, Node, SeparatorWrapper]] = []
         self._iteration = 0
         self._max_mult = self._ctl.get(
             "max_separator_multiplicity",
@@ -157,12 +247,15 @@ class MFCF:
         first_cl = self._get_first_clique()
 
         self._cliques: List[Clique] = [first_cl]
+        self._remaining_nodes_count = self._C.shape[0] - len(first_cl)
+
         self._separators_count: Counter = Counter()
+        self._pq_separators: set[Separator] = set()
         self._seen_separators: set[Separator] = set()
+
         self._peo: List[Node] = [v for v in first_cl]  # Perfect elimination order
-        self._outstanding_nodes: List[Node] = [
-            v for v in range(self._C.shape[0]) if v not in first_cl
-        ]
+        self._outstanding_nodes_mask = np.ones(self._C.shape[0], dtype=bool)
+        self._outstanding_nodes_mask[list(first_cl)] = False
 
         self._log_initial_state(first_cl)
 
@@ -199,33 +292,44 @@ class MFCF:
     # -------------------------------------------------------------------------
     def _compute_mfcf(self) -> None:
         """Greedy loop popping best (gain, v, sep) and updating structures."""
-        while self._outstanding_nodes:
+        while self._remaining_nodes_count > 0:
             self._iteration += 1
-            gain, v, sep = heapq.heappop(self._gains_pq)
-            if self._should_skip_candidate(gain, v, sep):
+            gain, v, sep_wrapper = self._pop_from_pq()
+            sep = sep_wrapper.separator
+            if self._should_skip_candidate(gain, v, sep_wrapper):
                 continue
 
             v, sep, parent_clique = self._apply_threshold_and_find_parent(gain, v, sep)
             cliques_before = list(self._cliques)
             new_clique = self._add_new_clique(parent_clique, sep, v)
 
-            self._check_proposed_separator(sep, cliques_before)
+            self._remaining_nodes_count -= 1
+            self._check_proposed_separator(sep_wrapper, cliques_before)
 
-            if not self._outstanding_nodes:
+            if self._remaining_nodes_count == 0:
                 break
+
+            self._update_pq_for_new_separator(sep_wrapper.separator_prior_threshold)
             self._process_new_clique_gains(new_clique)
 
     # -------------------------------------------------------------------------
     # Candidate checks & parent search
     # -------------------------------------------------------------------------
-    def _should_skip_candidate(self, gain: float, v: Node, sep: Separator) -> bool:
+    def _should_skip_candidate(self, gain: float, v: Node, sep_wrapper: SeparatorWrapper) -> bool:
         """Filter heap candidates by availability, size, multiplicity, and validity."""
-        if np.isnan(gain) or v not in self._outstanding_nodes:
-            return True
         # If drop_sep is enabled, disable candidates with a seen/used separator.
+        sep = sep_wrapper.separator
         if self._ctl.get("drop_sep", False):
             if sep in self._seen_separators or self._separators_count[sep] > 0:
                 return True
+        if np.isnan(gain):
+            return True
+
+        if not self._outstanding_nodes_mask[v]:
+            # v already used, recompute best gain for this sep and push back to heap
+            self._update_pq_for_new_separator(sep_wrapper.separator_prior_threshold)
+            return True
+
         # length constraint
         minc = int(self._ctl.get("min_clique_size", 2))
         maxc = int(self._ctl.get("max_clique_size", 4))
@@ -246,7 +350,7 @@ class MFCF:
         pos_gain = -gain  # negate back to positive for threshold compare
         if pos_gain < self._ctl["threshold"]:
             # start a new clique
-            v = self._outstanding_nodes[0]
+            v = int(self._outstanding_nodes_mask.argmax())
             sep = frozenset()
             parent_clique = frozenset()
         else:
@@ -269,7 +373,7 @@ class MFCF:
         """Add new clique, keep only maximal cliques, and update PEO/outstanding."""
         new_clique: Clique = frozenset(sep | {v})
         self._peo.append(v)
-        self._outstanding_nodes.remove(v)
+        self._outstanding_nodes_mask[v] = False
 
         self._log_added_clique(v, new_clique, parent_clique, sep)
 
@@ -282,11 +386,12 @@ class MFCF:
         self._cliques.append(new_clique)
         return new_clique
 
-    def _check_proposed_separator(self, proposed_separator: Separator, cliques_before: List[Clique]) -> None:
+    def _check_proposed_separator(self, separator_wrapper: SeparatorWrapper, cliques_before: List[Clique]) -> None:
         """
         Record separator if it's a proper subset of an existing clique
         and passes size/multiplicity constraints.
         """
+        proposed_separator = separator_wrapper.separator
         if not proposed_separator:
             return  # Empty separator, nothing to record
 
@@ -305,23 +410,47 @@ class MFCF:
                 break
 
         separator_recorded = False
-        if is_proper_separator and self._separators_count[proposed_separator] < self._max_mult:
-            self._separators_count[proposed_separator] += 1
-            separator_recorded = True
+        if self._separators_count[proposed_separator] < self._max_mult:
+            if is_proper_separator:
+                self._separators_count[proposed_separator] += 1
+                separator_recorded = True
+
+            sep_prior_threshold = separator_wrapper.separator_prior_threshold
+            if self._remaining_nodes_count != 0 and sep_prior_threshold not in self._pq_separators:
+                # We might reuse the same separator
+                self._update_pq_for_new_separator(sep_prior_threshold)
 
         self._log_processed_separator(proposed_separator, separator_recorded)
 
     def _process_new_clique_gains(self, clq: Clique) -> None:
         """Push gain candidates for all facets of the clique vs outstanding nodes."""
-        clique = tuple(clq)
+        clique = tuple(sorted(clq))
         clique_size = len(clq)
         max_size = int(self._ctl["max_clique_size"])
 
         facets = [clique] if clique_size < max_size else list(itertools.combinations(clique, clique_size - 1))
         for facet in facets:
-            for v in list(self._outstanding_nodes):
-                gain, ranked_sep = self._gf(v, list(facet))
-                heapq.heappush(self._gains_pq, (-gain, v, ranked_sep))
+            self._update_pq_for_new_separator(frozenset(facet))
+
+    # -------------------------------------------------------------------------
+    # priority queue management
+    # -------------------------------------------------------------------------
+    def _update_pq_for_new_separator(self, sep: Separator) -> None:
+        """Recompute and push best gain for a new separator if not already in PQ."""
+        if sep in self._pq_separators:
+            return
+        gain, v, ranked_sep = self._gf(self._outstanding_nodes_mask, sep)
+        self._push_to_pq(gain, v, ranked_sep)
+
+    def _pop_from_pq(self):
+        gain, v, sep_wrapper = heapq.heappop(self._gains_pq)
+        # if sep_wrapper.separator_prior_threshold not in self._separators_count and sep_wrapper.separator_prior_threshold not in self._seen_separators:
+        self._pq_separators.remove(sep_wrapper.separator_prior_threshold)
+        return gain, v, sep_wrapper
+    
+    def _push_to_pq(self, gain: float, v: Node, sep_wrapper: SeparatorWrapper):
+        heapq.heappush(self._gains_pq, (-gain, v, sep_wrapper))
+        self._pq_separators.add(sep_wrapper.separator_prior_threshold)
 
     # -------------------------------------------------------------------------
     # logo computation
@@ -349,7 +478,7 @@ class MFCF:
         logger.info("Seed Selection (%s)", self._ctl["method"])
         logger.info("  Seed clique: %s", format_frozenset(first_cl))
         logger.info("  Selected based on gain function maximization")
-        logger.info("  Remaining nodes: %d", len(self._outstanding_nodes))
+        logger.info("  Remaining nodes: %d", self._remaining_nodes_count)
         logger.info("---")
 
     def _log_added_clique(
