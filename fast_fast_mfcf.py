@@ -278,10 +278,15 @@ class MFCF:
         """Greedy loop popping best (gain, v, sep) and updating structures."""
         while self._remaining_nodes_count > 0:
             self._iteration += 1
-            gain, v, sep_wrapper = self._pop_from_pq()
-            sep = sep_wrapper.separator
-            if self._should_skip_candidate(gain, v, sep_wrapper):
-                continue
+            if self._gains_pq:
+                gain, v, sep_wrapper = self._pop_from_pq()
+                sep = sep_wrapper.separator
+                if self._should_skip_candidate(gain, v, sep_wrapper):
+                    continue
+            else:
+                # No candidates left; force a new clique
+                sep = self._cliques[-1]
+                gain, v, sep_wrapper = 0.0, int(self._outstanding_nodes_mask.argmax()), SeparatorWrapper(sep, sep)
 
             v, sep, parent_clique = self._apply_threshold_and_find_parent(gain, v, sep)
             cliques_before = list(self._cliques)
