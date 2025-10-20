@@ -59,22 +59,6 @@ def format_frozenset(fs: Iterable[int]) -> str:
         return str(sorted(list(fs))) if fs else "[]"
 
 
-def format_cliques_list(cliques: Iterable[Clique]) -> List[str]:
-    """Format list of cliques to readable strings."""
-    return [format_frozenset(clq) for clq in cliques]
-
-
-def format_counter(counter: Counter) -> str:
-    """Format Counter with frozenset keys to readable format."""
-    if not counter:
-        return "{}"
-    formatted: Dict[str, int] = {}
-    for fs, count in counter.items():
-        key = format_frozenset(fs) if fs else "[]"
-        formatted[key] = count
-    return str(formatted)
-
-
 # -----------------------------------------------------------------------------
 # Default control
 # -----------------------------------------------------------------------------
@@ -386,41 +370,52 @@ class MFCF:
         self._cliques.append(new_clique)
         return new_clique
 
-    def _check_proposed_separator(self, separator_wrapper: SeparatorWrapper, cliques_before: List[Clique]) -> None:
+    def _check_proposed_separator(
+        self,
+        separator_wrapper: SeparatorWrapper,
+        cliques_before: List[Clique],
+    ) -> None:
         """
-        Record separator if it's a proper subset of an existing clique
-        and passes size/multiplicity constraints.
-        """
-        proposed_separator = separator_wrapper.separator
-        if not proposed_separator:
-            return  # Empty separator, nothing to record
+        Consider a proposed separator and record it if it:
+          - is non-empty,
+          - has length in [min_clique_size - 1, max_clique_size),
+          - is not a superset (or equal) of any existing clique,
+          - and has not exceeded the multiplicity cap.
 
-        self._seen_separators.add(proposed_separator)
-        minc = int(self._ctl.get("min_clique_size", 2))
-        maxc = int(self._ctl.get("max_clique_size", 4))
-        sep_len = len(proposed_separator)
-        if not (sep_len >= minc - 1 and sep_len < maxc):
+        If applicable, also enqueue it for potential reuse.
+        """
+        sep = separator_wrapper.separator
+        if not sep:
+            # Empty separator, nothing to record
+            return
+        self._seen_separators.add(sep)
+
+        min_clique_size = int(self._ctl.get("min_clique_size", 2))
+        max_clique_size = int(self._ctl.get("max_clique_size", 4))
+        sep_len = len(sep)
+
+        # Size gate: [min-1, max)
+        if not (min_clique_size - 1 <= sep_len < max_clique_size):
             return
 
-        # proper subset check against cliques BEFORE adding the new one
-        is_proper_separator = True
-        for existing_clique in cliques_before:
-            if proposed_separator >= existing_clique:
-                is_proper_separator = False
-                break
+        # Must NOT be a superset (or equal) of any prior clique
+        not_superset_of_any_prior = not any(sep >= clique for clique in cliques_before)
 
-        separator_recorded = False
-        if self._separators_count[proposed_separator] < self._max_mult:
-            if is_proper_separator:
-                self._separators_count[proposed_separator] += 1
-                separator_recorded = True
+        recorded = False
+        under_multiplicity_cap = self._separators_count[sep] < self._max_mult
+        if not under_multiplicity_cap:
+            self._log_processed_separator(sep, recorded)
+            return
 
-            sep_prior_threshold = separator_wrapper.separator_prior_threshold
-            if self._remaining_nodes_count != 0 and sep_prior_threshold not in self._pq_separators:
-                # We might reuse the same separator
-                self._update_pq_for_new_separator(sep_prior_threshold)
+        if not_superset_of_any_prior:
+            self._separators_count[sep] += 1
+            recorded = True
 
-        self._log_processed_separator(proposed_separator, separator_recorded)
+        # We might reuse the same separator; keep PQ updated
+        if self._remaining_nodes_count != 0:
+            self._update_pq_for_new_separator(separator_wrapper.separator_prior_threshold)
+
+        self._log_processed_separator(sep, recorded)
 
     def _process_new_clique_gains(self, clq: Clique) -> None:
         """Push gain candidates for all facets of the clique vs outstanding nodes."""
@@ -444,10 +439,9 @@ class MFCF:
 
     def _pop_from_pq(self):
         gain, v, sep_wrapper = heapq.heappop(self._gains_pq)
-        # if sep_wrapper.separator_prior_threshold not in self._separators_count and sep_wrapper.separator_prior_threshold not in self._seen_separators:
         self._pq_separators.remove(sep_wrapper.separator_prior_threshold)
         return gain, v, sep_wrapper
-    
+
     def _push_to_pq(self, gain: float, v: Node, sep_wrapper: SeparatorWrapper):
         heapq.heappush(self._gains_pq, (-gain, v, sep_wrapper))
         self._pq_separators.add(sep_wrapper.separator_prior_threshold)
