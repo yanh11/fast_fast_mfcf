@@ -71,7 +71,7 @@ class TestMFCF(unittest.TestCase):
         ctl = mfcf_control()
         ctl['threshold'] = 0.00
         ctl['drop_sep'] = False
-        ctl['min_clique_size'] = 1
+        ctl['min_clique_size'] = 4
         ctl['max_clique_size'] = 10
         ctl['coordination_number'] = np.inf
         ctl['method'] = 'MFCF'
